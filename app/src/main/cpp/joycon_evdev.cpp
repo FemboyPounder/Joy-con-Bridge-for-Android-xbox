@@ -46,6 +46,7 @@ struct Handle {
 struct VirtualGamepad {
     int fd = -1;
     bool created = false;
+    bool xbox360 = false;
     std::mutex writeMutex;
     std::array<ff_effect, kMaxRumbleEffects> effects{};
     std::array<bool, kMaxRumbleEffects> effectValid{};
@@ -303,6 +304,7 @@ std::unique_ptr<VirtualGamepad> createVirtualGamepad(
         const std::string &name,
         int vendor,
         int product) {
+    const bool xbox360 = vendor == 0x045e && product == 0x028e;
     auto gamepad = std::make_unique<VirtualGamepad>();
     gamepad->fd = open("/dev/uinput", O_RDWR | O_NONBLOCK | O_CLOEXEC);
     if (gamepad->fd < 0) {
@@ -315,10 +317,11 @@ std::unique_ptr<VirtualGamepad> createVirtualGamepad(
             BTN_TL, BTN_TR, BTN_TL2, BTN_TR2, BTN_SELECT, BTN_START,
             BTN_MODE, BTN_THUMBL, BTN_THUMBR
     };
-    const std::array<int, 8> axes = {
-            ABS_X, ABS_Y, ABS_Z, ABS_RZ,
-            ABS_BRAKE, ABS_GAS, ABS_HAT0X, ABS_HAT0Y
-    };
+    // Xbox 360: RX/RY are the right stick and Z/RZ are LT/RT.
+    // Generic bridge devices retain the original Android mapping.
+    const std::array<int, 8> axes = xbox360
+            ? std::array<int, 8>{ABS_X, ABS_Y, ABS_RX, ABS_RY, ABS_Z, ABS_RZ, ABS_HAT0X, ABS_HAT0Y}
+            : std::array<int, 8>{ABS_X, ABS_Y, ABS_Z, ABS_RZ, ABS_BRAKE, ABS_GAS, ABS_HAT0X, ABS_HAT0Y};
 
     if (!setCapability(gamepad->fd, UI_SET_EVBIT, EV_KEY, "EV_KEY")
             || !setCapability(gamepad->fd, UI_SET_EVBIT, EV_ABS, "EV_ABS")
@@ -339,20 +342,30 @@ std::unique_ptr<VirtualGamepad> createVirtualGamepad(
             return nullptr;
         }
     }
-    if (!setAbsoluteAxis(gamepad->fd, ABS_X, 0, 255, 15)
-            || !setAbsoluteAxis(gamepad->fd, ABS_Y, 0, 255, 15)
-            || !setAbsoluteAxis(gamepad->fd, ABS_Z, 0, 255, 15)
-            || !setAbsoluteAxis(gamepad->fd, ABS_RZ, 0, 255, 15)
-            || !setAbsoluteAxis(gamepad->fd, ABS_BRAKE, 0, 255, 15)
-            || !setAbsoluteAxis(gamepad->fd, ABS_GAS, 0, 255, 15)
-            || !setAbsoluteAxis(gamepad->fd, ABS_HAT0X, -1, 1, 0)
-            || !setAbsoluteAxis(gamepad->fd, ABS_HAT0Y, -1, 1, 0)) {
+    const bool axisSetupFailed = xbox360
+            ? (!setAbsoluteAxis(gamepad->fd, ABS_X, 0, 255, 15)
+               || !setAbsoluteAxis(gamepad->fd, ABS_Y, 0, 255, 15)
+               || !setAbsoluteAxis(gamepad->fd, ABS_RX, 0, 255, 15)
+               || !setAbsoluteAxis(gamepad->fd, ABS_RY, 0, 255, 15)
+               || !setAbsoluteAxis(gamepad->fd, ABS_Z, 0, 255, 0)
+               || !setAbsoluteAxis(gamepad->fd, ABS_RZ, 0, 255, 0)
+               || !setAbsoluteAxis(gamepad->fd, ABS_HAT0X, -1, 1, 0)
+               || !setAbsoluteAxis(gamepad->fd, ABS_HAT0Y, -1, 1, 0))
+            : (!setAbsoluteAxis(gamepad->fd, ABS_X, 0, 255, 15)
+               || !setAbsoluteAxis(gamepad->fd, ABS_Y, 0, 255, 15)
+               || !setAbsoluteAxis(gamepad->fd, ABS_Z, 0, 255, 15)
+               || !setAbsoluteAxis(gamepad->fd, ABS_RZ, 0, 255, 15)
+               || !setAbsoluteAxis(gamepad->fd, ABS_BRAKE, 0, 255, 15)
+               || !setAbsoluteAxis(gamepad->fd, ABS_GAS, 0, 255, 15)
+               || !setAbsoluteAxis(gamepad->fd, ABS_HAT0X, -1, 1, 0)
+               || !setAbsoluteAxis(gamepad->fd, ABS_HAT0Y, -1, 1, 0));
+    if (axisSetupFailed) {
         close(gamepad->fd);
         return nullptr;
     }
 
     uinput_setup setup{};
-    setup.id.bustype = BUS_BLUETOOTH;
+    setup.id.bustype = xbox360 ? BUS_USB : BUS_BLUETOOTH;
     setup.id.vendor = static_cast<__u16>(vendor);
     setup.id.product = static_cast<__u16>(product);
     setup.id.version = 1;
@@ -365,6 +378,7 @@ std::unique_ptr<VirtualGamepad> createVirtualGamepad(
         return nullptr;
     }
     gamepad->created = true;
+    gamepad->xbox360 = xbox360;
     setLastError("");
     return gamepad;
 }
@@ -417,10 +431,17 @@ bool writeVirtualReport(VirtualGamepad *gamepad, const std::array<uint8_t, 10> &
     appendEvent(events, count, EV_ABS, ABS_HAT0Y, kHatY[static_cast<size_t>(hat)]);
     appendEvent(events, count, EV_ABS, ABS_X, report[4]);
     appendEvent(events, count, EV_ABS, ABS_Y, report[5]);
-    appendEvent(events, count, EV_ABS, ABS_Z, report[6]);
-    appendEvent(events, count, EV_ABS, ABS_RZ, report[7]);
-    appendEvent(events, count, EV_ABS, ABS_BRAKE, report[8]);
-    appendEvent(events, count, EV_ABS, ABS_GAS, report[9]);
+    if (gamepad->xbox360) {
+        appendEvent(events, count, EV_ABS, ABS_RX, report[6]);
+        appendEvent(events, count, EV_ABS, ABS_RY, report[7]);
+        appendEvent(events, count, EV_ABS, ABS_Z, report[8]);
+        appendEvent(events, count, EV_ABS, ABS_RZ, report[9]);
+    } else {
+        appendEvent(events, count, EV_ABS, ABS_Z, report[6]);
+        appendEvent(events, count, EV_ABS, ABS_RZ, report[7]);
+        appendEvent(events, count, EV_ABS, ABS_BRAKE, report[8]);
+        appendEvent(events, count, EV_ABS, ABS_GAS, report[9]);
+    }
     appendEvent(events, count, EV_SYN, SYN_REPORT, 0);
 
     std::lock_guard<std::mutex> guard(gamepad->writeMutex);
